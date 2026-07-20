@@ -124,7 +124,36 @@ Add one subsection to this README in the same pull request. It must contain:
 
 Do not commit `.env`, credentials, personal memory, generated databases, unrestricted local paths, benchmark output containing private data, or provider responses containing secrets. Use synthetic identities in every proof.
 
-## Student contribution: speculative recall-vs-web race with evidence-justified cancellation
+## Student contribution: Part 1 — floor reproduction
+
+Four baseline behaviours reproduced end-to-end through the real runtime and the
+real A2A adapter, offline (deterministic embedder; stubbed web/LLM; an in-process
+A2A gRPC server). Full prompt, graph, ordered event trace, provider/agent
+assignments, evidence, and answer for each are printed by:
+
+```bash
+uv run python proofs/floor_cases.py
+```
+
+| Case | Prompt / request | Graph (earned in order) | What the ordered trace proves |
+|---|---|---|---|
+| **Live expansion** | *Search for "Python asyncio best practices", read the top 3 results…* | `search → {fetch_1,fetch_2,fetch_3} → distill → answer` | `search` is the only node until it succeeds (#4); the three `fetch_*` nodes are added *after* (#5) and start together (#6–8). Future nodes never precede their inputs. |
+| **Durable-memory round trip** | run A: *My mom's birthday is 15 May 2026. Remember that…* → run B: *When is mom's birthday?* | A: `remember → reminder → answer`; B: `recall → answer` | B (a *separate* runtime instance) recalls the `kind=fact` sourced to `api://agent/runs`, ranked above the model's own prior episode. The fact — not the earlier answer — is the citation. |
+| **Semantic document query** | *Index the file paper.md and tell me its key result.* | `index_file → recall → distill → answer` | Indexing is durable *before* retrieval is added (#5); the answer is grounded in the retrieved `document_chunk`, provider assignments visible per node. |
+| **A2A waiting/resume** | *Slow remote report: explain why an agent card is not permission to access local memory.* | `remote` (waiting → pending → succeeded) | Node parks in `waiting` and the local worker is released; `a2a_task_completed` (external) resumes exactly that node; the artifact returns as untrusted evidence. Trace: `run_started → wait → a2a_task_completed → run_resumed → task_started → task_succeeded → finish`. |
+
+**Honest limitation the trace exposed.** In the semantic-document case the manifest
+reports `segmentation outcomes=['below_semantic_floor']`: the sample document was
+short enough that Rohan V2's suffix-rollover boundary detection **never actually
+ran** — the file became a single chunk by the deliberate small-block floor, not by
+topic analysis. So this case proves the *indexing/retrieval/grounding path* but does
+**not** exercise semantic chunking; that requires a multi-topic document above the
+floor. A second, subtler observation: cross-run recall also surfaces the model's own
+prior answer as an `episode`; it is correctly ranked below the user fact here, but
+that ranking — not a hard boundary — is all that stops a model-authored prior answer
+from being treated as a user source.
+
+## Student contribution: Part 2 & 3 — speculative recall-vs-web race with evidence-justified cancellation
 
 **1. User-visible capability.** The old planner commits to exactly one strategy
 per intent: a memory question runs `recall` only, and if durable memory is empty
