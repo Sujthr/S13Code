@@ -14,7 +14,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from s13code.core.live_graph import GraphPatch, GraphStore, LiveGraphExecutor, TaskSpec
+from s13code.core.live_graph import (
+    GraphPatch,
+    GraphStore,
+    LiveGraphExecutor,
+    TaskSpec,
+    resolve_speculative_race,
+)
 from s13code.core.memory import MemoryKind, MemoryRecord, MemoryScope, MemoryStore, Principal, SourceRef
 from s13code.core.memory.embeddings import OllamaNomicEmbedder
 from s13code.planner import ConstrainedGraphPatchPlanner
@@ -76,6 +82,26 @@ def _work_intent(prompt: str) -> tuple[str, list[TaskSpec]]:
             TaskSpec("search_weather", "researcher",
                      {"query": "Tokyo Saturday weather forecast", "max_results": 3}, {"agent": "weather_researcher"}),
         ]
+
+    # Speculative recall: the user wants an answer from durable memory but has
+    # explicitly authorised a web fallback if memory does not have it. The old
+    # planner cannot express this -- it commits to exactly one strategy. Here we
+    # launch both and let the first *usable* outcome earn the answer, cancelling
+    # the redundant strategy only when evidence (not arrival order) justifies it.
+    if ("search" in lower or "web" in lower) and re.search(
+        r"\b(if\s+(?:you\s+)?(?:don'?t|do\s+not|can'?t|cannot|are\s+not\s+sure|aren'?t\s+sure|"
+        r"not\s+sure|haven'?t)|or\s+(?:search|look\s+it\s+up)|whichever\s+(?:is\s+)?(?:faster|confident|first))",
+        lower,
+    ):
+        web_query = re.sub(
+            r"[\.,]?\s*(?:but\s+|and\s+|,\s*)?(?:please\s+)?(?:also\s+)?(?:search|look)\b.*$",
+            "", prompt, flags=re.IGNORECASE,
+        ).strip() or prompt
+        return "speculative_recall", [
+            TaskSpec("recall", "memory_recall", {"query": prompt}),
+            TaskSpec("web", "web_search", {"query": web_query, "max_results": 3}, {"agent": "web_fallback"}),
+        ]
+
     return "memory", [TaskSpec("recall", "memory_recall", {"query": prompt})]
 
 
@@ -136,6 +162,31 @@ class S13Runtime:
                 return GraphPatch(add=(TaskSpec("answer", "answer_with_evidence", {"query": prompt}),),
                                   connect=tuple((parent, "answer") for parent in parents), reason=reason)
 
+            def speculative_patch(self, graph, event) -> GraphPatch:
+                """Resolve a speculative recall-vs-web race by evidence, not arrival.
+
+                Only a usable outcome may cancel a still-live sibling; an empty
+                or failed strategy leaves the sibling running so the graph never
+                tears down the single path that still owns evidence.
+                """
+                sibling = "web" if event.node_id == "recall" else "recall"
+                sibling_state = graph.nodes.get(sibling, {}).get("state")
+                usable = bool((event.payload or {}).get("hits"))
+                decision = resolve_speculative_race(
+                    outcome_usable=usable, sibling_state=sibling_state, answered="answer" in graph.nodes,
+                )
+                if decision.cancel_sibling:
+                    winners = tuple(node_id for node_id, node in graph.nodes.items()
+                                    if node_id != "answer" and node["state"] == "succeeded")
+                    return GraphPatch(
+                        add=(TaskSpec("answer", "answer_with_evidence", {"query": prompt}),),
+                        connect=tuple((winner, "answer") for winner in winners),
+                        cancel=(sibling,), reason=decision.reason,
+                    )
+                if decision.can_answer:
+                    return self.answer_patch(graph, reason=decision.reason)
+                return GraphPatch(reason=decision.reason)
+
             async def plan(self, graph, event):
                 if event.kind == "run_started":
                     first = list(initial_frontier)
@@ -143,6 +194,9 @@ class S13Runtime:
                         first.append(TaskSpec("remember", "remember_explicit_fact", {"text": prompt}))
                     return GraphPatch(add=tuple(first),
                                       reason=f"first frontier selected for {mode}")
+                if mode == "speculative_recall" and event.node_id in ("recall", "web") \
+                        and event.kind in ("task_succeeded", "task_failed"):
+                    return self.speculative_patch(graph, event)
                 if event.node_id == "index_file" and event.kind == "task_succeeded":
                     return GraphPatch(add=(TaskSpec("recall", "memory_recall", {"query": prompt}),),
                                       connect=(("index_file", "recall"),),

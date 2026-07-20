@@ -8,9 +8,11 @@ from .core import (
     NodeState,
     TaskSpec,
 )
+from .speculative import RaceDecision, resolve_speculative_race
 from .store import GraphStore
 
 __all__ = [
     "Event", "GraphPatch", "GraphSnapshot", "GraphStore",
-    "LiveGraphExecutor", "NodeState", "TaskSpec",
+    "LiveGraphExecutor", "NodeState", "RaceDecision",
+    "resolve_speculative_race", "TaskSpec",
 ]

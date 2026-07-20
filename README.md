@@ -124,6 +124,124 @@ Add one subsection to this README in the same pull request. It must contain:
 
 Do not commit `.env`, credentials, personal memory, generated databases, unrestricted local paths, benchmark output containing private data, or provider responses containing secrets. Use synthetic identities in every proof.
 
+## Student contribution: speculative recall-vs-web race with evidence-justified cancellation
+
+**1. User-visible capability.** The old planner commits to exactly one strategy
+per intent: a memory question runs `recall` only, and if durable memory is empty
+the run answers from nothing. This extension adds an outcome-driven behaviour the
+planner could not express before. When a user asks a memory question *and*
+explicitly authorises a web fallback, the graph launches **both** strategies
+(`recall` and `web`) at once and lets the first *usable* outcome earn the answer.
+The redundant strategy is cancelled only when **evidence**, not arrival order,
+justifies it: a fast-but-empty `recall` never tears down a slower `web` search
+that still owns the only evidence. When memory *is* confident, the still-running
+`web` worker is cancelled and its late result is discarded rather than recorded.
+
+The decision is a single pure function,
+[`resolve_speculative_race`](s13code/core/live_graph/speculative.py), wired into
+the deterministic planner's new `speculative_recall` mode in
+[`runtime.py`](s13code/runtime.py). It changes no existing intent and adds no
+dependency.
+
+**2. Exact request.**
+
+```bash
+curl -s http://127.0.0.1:8113/v1/agent/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "What is my travel budget? Answer from memory, but search the web if you don'\''t have it.",
+    "tenant_id": "proof", "project_id": "speculative",
+    "user_id": "student-01", "agent_id": "assistant"
+  }'
+```
+
+The reproducible offline proof (`proofs/speculative_race.py`) runs the same
+prompt through the real runtime twice, with and without a durable fact.
+
+**3 + 4 + 5. Graph, ordered event trace, final result, evidence & assignments.**
+
+*Scenario A — a durable fact exists, so `recall` wins and `web` is cancelled:*
+
+```
+graph nodes:  recall succeeded (memory_recall) | web cancelled (web_fallback) | answer succeeded (answer_with_evidence)
+graph edges:  recall -> answer            # answer depends only on the winning strategy
+
+ #1  run_started
+ #2  graph_patched      add=['recall','web']   (first frontier for speculative_recall)
+ #3  task_started       recall
+ #4  task_started       web                     # both strategies live together
+ #5  task_succeeded     recall
+ #6  task_cancelled     web                      # cancelled while running...
+ #7  graph_patched      add=['answer'] cancel=['web']   (usable evidence; cancel the redundant live sibling)
+ #8  task_started       answer
+ #9  task_succeeded     answer
+ #10 graph_patched      finish                   (grounded answer produced)
+
+final answer: "Grounded answer built from 1 evidence item(s)."
+evidence:     the durable FACT "Travel budget is 90000 rupees." [source: chat://budget/1]
+              web's late result is NOT in the graph (node result = null)
+providers:    answer -> stub-gateway   recall/web -> local (no provider)
+```
+
+The `answer` node does not exist until event #7 — *after* the first real outcome
+(#5). Future nodes never precede their inputs.
+
+*Scenario B — no durable fact, so empty `recall` waits and `web` supplies the answer:*
+
+```
+graph edges:  recall -> answer, web -> answer
+
+ #5  task_succeeded     recall
+ #6  graph_patched      (no evidence; await the still-live speculative sibling)   # NOT cancelled
+ #7  task_succeeded     web
+ #8  graph_patched      add=['answer']            (sibling terminal; answer from web evidence)
+ #11 graph_patched      finish
+
+final answer: "Grounded answer built from 1 evidence item(s)."  (grounded in the web hit)
+```
+
+**6. Adversarial failure and fix.** The attack is the exact scenario a naive
+speculative planner gets wrong: a **fast-but-empty `recall` racing a slow-but-useful
+`web`**. A naive planner cancels the sibling on arrival order, so it tears down
+`web` the moment empty `recall` returns and answers with zero evidence.
+`tests/test_speculative_cancellation.py` runs this attack both ways against the
+same workers:
+
+- `test_naive_arrival_order_planner_loses_the_only_evidence` — **before**: the
+  naive decision cancels `web`; the answer worker sees `0` evidence items.
+- `test_evidence_justified_planner_waits_and_keeps_the_evidence` — **after**: the
+  shipped `resolve_speculative_race` keeps `web` alive; the answer worker sees `1`.
+
+A second attack, `test_late_result_after_cancellation_is_discarded`, forces both
+strategies to complete in one event-loop tick: the winner cancels the loser, and
+the loser's already-produced result is dropped instead of patching the graph (no
+`task_succeeded` for the loser, planner never re-entered for it).
+
+**7. Reproduce from a fresh checkout.**
+
+```bash
+git clone https://github.com/Sujthr/S13Code.git && cd S13Code
+git checkout feat/speculative-strategy-race
+uv sync --dev
+
+# the extension's proof suite (11 tests: unit, executor-level attack, e2e runtime)
+uv run pytest tests/test_speculative_cancellation.py -v
+
+# the end-to-end trace shown above (offline: no network, no Ollama, no keys)
+uv run python proofs/speculative_race.py
+
+# floor + extension together
+uv run ruff check .
+uv run pytest -q
+```
+
+> Honest limitation exposed by the traces: `resolve_speculative_race` treats
+> "usable" as "the outcome returned any hit". A high-similarity but *irrelevant*
+> memory hit would still win the race and cancel a web search that might have been
+> more on-point. Usefulness here means "produced candidate evidence", not
+> "produced correct evidence" — ranking relevance stays with the downstream
+> answer worker, which is instructed to treat similarity as a hint, not proof.
+
 ## License
 
 MIT. See `LICENSE`.
